@@ -23,10 +23,10 @@ def fetch_ergo_data():
     """
     Optimized Engine:
     - Uses Set Difference to find strict NEW transactions.
-    - Automatically forgets transactions that leave the mempool (mined/dropped).
-    - No more 'flush and spike' behavior.
+    - Automatically forgets transactions that leave the mempool.
+    - Caps 'new_transactions' buffer to prevent memory leaks when no client is connected.
     """
-    global known_tx_ids, current_node_url, latest_blocks
+    global known_tx_ids, current_node_url, latest_blocks, new_transactions
     print(f"--- Ergo Node Engine Online ({current_node_url}) ---")
 
     last_block_fetch = 0
@@ -50,12 +50,11 @@ def fetch_ergo_data():
                     new_ids = current_mempool_ids - known_tx_ids
 
                     # SYNC MEMORY:
-                    # By setting known_tx_ids to current_mempool_ids, we:
-                    # 1. Add the new ones.
-                    # 2. Automatically 'forget' ones that were mined (no longer in mempool).
+                    # 1. Add new ones.
+                    # 2. Forget mined/dropped ones (set intersection).
                     known_tx_ids = current_mempool_ids
 
-                    # Process only the NEW items for the frontend
+                    # Process only the NEW items
                     batch_to_send = []
                     for tx in tx_list:
                         if tx['id'] in new_ids:
@@ -70,12 +69,19 @@ def fetch_ergo_data():
                                 'asset_count': total_assets,
                                 'ts': time.time() * 1000
                             })
-                    
+
                     if batch_to_send:
                         with data_lock:
                             new_transactions.extend(batch_to_send)
+
+                            # --- MEMORY LEAK FIX ---
+                            # If no client is connected, this list would grow infinitely.
+                            # We cap it at 100 items (approx 2-3 seconds of heavy traffic).
+                            if len(new_transactions) > 100:
+                                new_transactions = new_transactions[-100:]
+                            # -----------------------
+
             except Exception as e:
-                # Network blip, keep going
                 pass
 
             # 2. FETCH BLOCK HEIGHTS (Every 5s)
@@ -204,7 +210,8 @@ def stream():
                 if new_transactions:
                     for tx in new_transactions:
                         yield f"data: {json.dumps({'type': 'tx', 'data': tx})}\n\n"
-                    new_transactions = []
+                    # Clear the list after sending so we don't send duplicates to this client
+                    new_transactions[:] = []
                 yield f"data: {json.dumps({'type': 'blocks', 'data': latest_blocks, 'keepalive': True})}\n\n"
             time.sleep(1)
 
@@ -452,18 +459,15 @@ HTML_TEMPLATE = """
 
         function addToQueue(tx) { txQueue.push(tx); }
 
-        // --- NEW: Processed Set to prevent duplicate rendering in frontend ---
+        // --- DUPLICATE PREVENTION ---
         const processedTxIds = new Set();
 
         function addToRecentList(tx) {
             if(tx.id && tx.id.startsWith("TEST_")) {
                 // allow test
             } else {
-                // Check for duplicates
                 if (processedTxIds.has(tx.id)) return;
                 processedTxIds.add(tx.id);
-                
-                // Keep the browser memory clean
                 if (processedTxIds.size > 2000) processedTxIds.clear();
             }
 
@@ -536,7 +540,7 @@ HTML_TEMPLATE = """
             } catch(e) { content.innerHTML = "<div style='text-align:center; color:red; margin-top:50px;'>Fetch Failed</div>"; }
         }
 
-        // --- WARM PAD AUDIO ENGINE ---
+        // --- AUDIO ENGINE ---
         let drumKit, hatKit, padSynthA, padSynthB, piano, shimmerSynth, blockPad;
         let reverb, delay, wide, tremolo;
         let isAudioReady = false;
@@ -660,16 +664,10 @@ HTML_TEMPLATE = """
                 if(note) hatKit.triggerAttack("32n", time, 0.5);
             }, [null, "x", "x", "x"], "16n").start(0);
 
-            // CHANGED: 2m instead of 4m for faster progression
             const chordLoop = new Tone.Loop(time => {
                 const chord = CHORDS[currentChordIndex];
-
-                // Play chord
                 padSynthA.triggerAttackRelease(chord.notes, "4m", time);
-
-                // Add Deep Bass Note from Piano
                 piano.triggerAttack(chord.root, time, 0.6);
-
                 currentChordIndex = (currentChordIndex + 1) % CHORDS.length;
             }, "2m").start(0);
 
@@ -684,9 +682,7 @@ HTML_TEMPLATE = """
             let t = now;
             for(let i=0; i<notes; i++) {
                 const n = scale[Math.floor(Math.random() * scale.length)];
-                // Play soft piano
                 piano.triggerAttack(n, t, 0.55); 
-                // Add halo
                 if(shimmerSynth) shimmerSynth.triggerAttackRelease(n, "8n", t);
                 t += 0.25; 
             }
@@ -696,10 +692,8 @@ HTML_TEMPLATE = """
             if(heights.length > 0) {
                 const newest = heights[0];
                 if(newest > lastBlockHeight && lastBlockHeight !== 0) {
-                    // Deep Ocean Swell
                     if(blockPad) {
                         blockPad.triggerAttackRelease(["C2", "G2", "C3", "G3"], "8m", Tone.now());
-                        // Deep Piano Strike
                         piano.triggerAttack("C1", Tone.now(), 0.9);
                     }
                 }
@@ -742,7 +736,7 @@ HTML_TEMPLATE = """
                 map: mapTex, 
                 transparent: true, 
                 opacity: 0.9,
-                color: 0x88ccff, // Cyber blue tint
+                color: 0x88ccff, 
                 blending: THREE.AdditiveBlending 
             });
             earth = new THREE.Group(); 
