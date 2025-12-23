@@ -21,10 +21,11 @@ data_lock = threading.Lock()
 # --- BACKEND ENGINE ---
 def fetch_ergo_data():
     """
-    Optimized Engine:
-    - Uses Set Difference to find strict NEW transactions.
-    - Automatically forgets transactions that leave the mempool.
-    - Caps 'new_transactions' buffer to prevent memory leaks when no client is connected.
+    Final Logic:
+    1. Scan FULL mempool (fixes the 'forgetting' bug).
+    2. Compare against known IDs.
+    3. Send ALL new IDs (no hiding data).
+    4. Sleep 5s to group them into readable batches.
     """
     global known_tx_ids, current_node_url, latest_blocks, new_transactions
     print(f"--- Ergo Node Engine Online ({current_node_url}) ---")
@@ -33,30 +34,31 @@ def fetch_ergo_data():
 
     while True:
         try:
-            # 1. FETCH MEMPOOL (Every 1s)
+            # 1. FETCH MEMPOOL
             url = f"{current_node_url}/transactions/unconfirmed"
             try:
-                response = requests.get(url, timeout=2)
+                response = requests.get(url, timeout=3)
                 if response.status_code == 200:
-                    tx_list = response.json()
+                    # Get EVERYTHING currently in the pool
+                    all_tx_list = response.json()
 
-                    # SAFETY: Limit processing to avoid massive payloads
-                    if len(tx_list) > 50: tx_list = tx_list[:50]
+                    # 1. ESTABLISH STATE:
+                    # We must look at every ID to know what exists.
+                    # If we slice here, we 'forget' valid TXs and they reappear as 'new' later.
+                    current_mempool_ids = set(tx['id'] for tx in all_tx_list)
 
-                    # Create a set of IDs currently in the mempool
-                    current_mempool_ids = set(tx['id'] for tx in tx_list)
-
-                    # Identify strictly NEW transactions (Node has them, we don't)
+                    # 2. CALC DIFFERENCE: Strictly new IDs
                     new_ids = current_mempool_ids - known_tx_ids
 
-                    # SYNC MEMORY:
-                    # 1. Add new ones.
-                    # 2. Forget mined/dropped ones (set intersection).
+                    # 3. UPDATE MEMORY
+                    # This automatically removes old mined/dropped TXs from our memory
                     known_tx_ids = current_mempool_ids
 
-                    # Process only the NEW items
+                    # 4. PREPARE PAYLOAD
                     batch_to_send = []
-                    for tx in tx_list:
+
+                    # Iterate through the full list, but only process the NEW ones
+                    for tx in all_tx_list:
                         if tx['id'] in new_ids:
                             total_nano = sum(o.get('value', 0) for o in tx.get('outputs', []))
                             erg_amount = total_nano / 1_000_000_000
@@ -70,22 +72,22 @@ def fetch_ergo_data():
                                 'ts': time.time() * 1000
                             })
 
+                    # 5. SEND IT ALL
+                    # We do not slice batch_to_send. If 50 txs came in, we show 50.
                     if batch_to_send:
                         with data_lock:
                             new_transactions.extend(batch_to_send)
 
-                            # --- MEMORY LEAK FIX ---
-                            # If no client is connected, this list would grow infinitely.
-                            # We cap it at 100 items (approx 2-3 seconds of heavy traffic).
-                            if len(new_transactions) > 100:
-                                new_transactions = new_transactions[-100:]
-                            # -----------------------
+                            # Safety cap for the "Empty Room" memory leak
+                            # (Only affects if no browser is connected for a long time)
+                            if len(new_transactions) > 500:
+                                new_transactions = new_transactions[-500:]
 
             except Exception as e:
-                pass
+                print(f"Fetch Error: {e}")
 
-            # 2. FETCH BLOCK HEIGHTS (Every 5s)
-            if time.time() - last_block_fetch > 5:
+            # 2. FETCH BLOCK HEIGHTS (Every 10s is plenty)
+            if time.time() - last_block_fetch > 10:
                 try:
                     b_url = f"{current_node_url}/blocks/lastHeaders/5"
                     b_res = requests.get(b_url, timeout=2)
@@ -101,7 +103,9 @@ def fetch_ergo_data():
         except Exception as e:
             pass
 
-        time.sleep(1)
+        # 3. SLEEP 5 SECONDS
+        # This prevents spamming the node and groups TXs into nice "waves"
+        time.sleep(5)
 
 
 threading.Thread(target=fetch_ergo_data, daemon=True).start()
